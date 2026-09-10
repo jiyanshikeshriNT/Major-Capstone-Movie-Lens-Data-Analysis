@@ -90,3 +90,62 @@ def write_ingestion_log(
         print(
             f"Failed to write ingestion log for {file_name}: {e}"
         )
+
+
+# Transformation logging for silver.transformation_log
+def write_transformation_log(
+    source_table,
+    target_table,
+    source_row_count,
+    target_row_count,
+    bad_row_count,
+    status,
+    error_message=None
+):
+
+    try:
+
+        conn = get_postgres_connection()
+        cursor = conn.cursor()
+
+        insert_query = """
+            INSERT INTO silver.transformation_log
+            (
+                source_table,
+                target_table,
+                source_row_count,
+                target_row_count,
+                bad_row_count,
+                status,
+                error_message
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+        """
+
+        cursor.execute(
+            insert_query,
+            (
+                source_table,
+                target_table,
+                source_row_count,
+                target_row_count,
+                bad_row_count,
+                status,
+                error_message
+            )
+        )
+
+        conn.commit()
+
+        cursor.close()
+        conn.close()
+
+        print(
+            f"Transformation log written successfully for {target_table}"
+        )
+
+    except Exception as e:
+
+        print(
+            f"Failed to write transformation log for {target_table}: {e}"
+        )
