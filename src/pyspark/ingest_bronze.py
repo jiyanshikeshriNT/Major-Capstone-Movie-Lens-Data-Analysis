@@ -108,6 +108,8 @@ def ingest_movies():
         movies_df = (
             spark.read
             .option("header", True)
+            .option("quote", '"')
+            .option("escape", '"')
             .schema(movies_schema)
             .csv(movies_path)
         )
@@ -167,6 +169,8 @@ def ingest_tags():
         tags_df = (
             spark.read
             .option("header", True)
+            .option("quote", '"')
+            .option("escape", '"')
             .schema(tags_schema)
             .csv(tags_path)
         )
