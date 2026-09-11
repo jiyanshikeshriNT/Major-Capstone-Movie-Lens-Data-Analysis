@@ -53,9 +53,35 @@ with DAG(
         """
     )
 
-    (
-        transform_links
-        >> transform_movies
-        >> transform_ratings
-        >> transform_tags
+    transform_movie_metadata = BashOperator(
+        task_id="transform_movie_metadata",
+        bash_command="""
+        cd /opt/movielens &&
+        python -m src.pyspark.transform_silver transform_movie_metadata
+        """
     )
+
+    transform_user_ratings_master = BashOperator(
+        task_id="transform_user_ratings_master",
+        bash_command="""
+        cd /opt/movielens &&
+        python -m src.pyspark.transform_silver transform_user_ratings_master
+        """
+    )
+
+    # (
+    #     transform_links
+    #     >> transform_movies
+    #     >> transform_ratings
+    #     >> transform_tags
+    # )
+
+    # movie_metadata depends on links and movies
+    [transform_links, transform_movies] >> transform_movie_metadata
+
+    # user_ratings_master depends on ratings, tags and movie_metadata
+    [
+        transform_ratings,
+        transform_tags,
+        transform_movie_metadata
+    ] >> transform_user_ratings_master

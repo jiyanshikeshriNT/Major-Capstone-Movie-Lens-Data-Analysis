@@ -149,3 +149,29 @@ def write_transformation_log(
         print(
             f"Failed to write transformation log for {target_table}: {e}"
         )
+
+# Function to get the table row count for audit purpose
+def get_table_row_count(table_name):
+
+    conn = None
+    cursor = None
+
+    try:
+        conn = get_postgres_connection()
+        cursor = conn.cursor()
+
+        query = f"SELECT COUNT(*) FROM {table_name}"
+
+        cursor.execute(query)
+
+        row_count = cursor.fetchone()[0]
+
+        return row_count
+
+    finally:
+
+        if cursor:
+            cursor.close()
+
+        if conn:
+            conn.close()
