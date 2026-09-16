@@ -1,14 +1,5 @@
 import sys
 
-from pyspark.sql.types import(
-    StructType,
-    StructField,
-    IntegerType,
-    StringType,
-    LongType, 
-    DoubleType
-)
-
 from src.python.config import(
     POSTGRES_URL,
     POSTGRES_PROPERTIES,
@@ -42,18 +33,12 @@ def ingest_links():
     spark = create_spark_session()
 
     try:
-        links_schema = StructType([
-            StructField("movieId", IntegerType(), True),
-            StructField("imdbId", StringType(), True),
-            StructField("tmdbId", StringType(), True)
-        ])
-
         links_path = str(DATA_DIR / "links.csv")
 
         links_df = (
             spark.read
             .option("header", True)
-            .schema(links_schema)
+            .option("inferSchema", True)
             .csv(links_path)
         )
 
@@ -99,18 +84,13 @@ def ingest_movies():
 
     spark = create_spark_session()
     try:
-        movies_schema = StructType([
-            StructField("movieId", IntegerType(), True),
-            StructField("title", StringType(), True),
-            StructField("genres", StringType(), True)
-        ])
         movies_path = str(DATA_DIR / "movies.csv")
         movies_df = (
             spark.read
             .option("header", True)
+            .option("inferSchema", True)
             .option("quote", '"')
             .option("escape", '"')
-            .schema(movies_schema)
             .csv(movies_path)
         )
 
@@ -157,21 +137,14 @@ def ingest_tags():
     spark = create_spark_session()
 
     try:
-        tags_schema = StructType([
-            StructField("userId", IntegerType(), True),
-            StructField("movieId", IntegerType(), True),
-            StructField("tag", StringType(), True),
-            StructField("timestamp", LongType(), True)
-        ])
-
         tags_path = str(DATA_DIR / "tags.csv")
 
         tags_df = (
             spark.read
             .option("header", True)
+            .option("inferSchema", True)
             .option("quote", '"')
             .option("escape", '"')
-            .schema(tags_schema)
             .csv(tags_path)
         )
 
@@ -245,13 +218,6 @@ def ingest_ratings():
 
     spark = create_spark_session()
 
-    ratings_schema = StructType([
-        StructField("userId", IntegerType(), True),
-        StructField("movieId", IntegerType(), True),
-        StructField("rating", DoubleType(), True),
-        StructField("timestamp", LongType(), True)
-    ])
-
     ratings_files = [
         "ratings_part1.csv",
         "ratings_part2.csv",
@@ -282,7 +248,7 @@ def ingest_ratings():
             ratings_df = (
                 spark.read
                 .option("header", True)
-                .schema(ratings_schema)
+                .option("inferSchema", True)
                 .csv(ratings_path)
             )
 
