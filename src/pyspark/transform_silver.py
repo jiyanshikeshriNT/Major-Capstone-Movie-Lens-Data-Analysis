@@ -1,5 +1,14 @@
 import sys
 
+from pyspark.sql.types import(
+    StructType,
+    StructField,
+    IntegerType,
+    StringType,
+    LongType, 
+    DoubleType
+)
+
 from src.python.config import (
     POSTGRES_URL,
     POSTGRES_PROPERTIES,
@@ -8,7 +17,8 @@ from src.python.config import (
 from src.python.utils import (
     create_spark_session,
     write_transformation_log,
-    get_table_row_count
+    get_table_row_count,
+    enforce_schema
 )
 
 from pyspark.sql.functions import (
@@ -18,8 +28,37 @@ from pyspark.sql.functions import (
     trim,
     col,
     concat_ws,
-    collect_set
+    collect_set,
+    from_unixtime
 )
+
+# Expected schemas for Silver layer
+links_schema = StructType([
+    StructField("movieId", IntegerType(), True),
+    StructField("imdbId", IntegerType(), True),
+    StructField("tmdbId", IntegerType(), True)
+])
+
+movies_schema = StructType([
+    StructField("movieId", IntegerType(), True),
+    StructField("title", StringType(), True),
+    StructField("genres", StringType(), True)
+])
+
+ratings_schema = StructType([
+    StructField("userId", IntegerType(), True),
+    StructField("movieId", IntegerType(), True),
+    StructField("rating", DoubleType(), True),
+    StructField("timestamp", LongType(), True)
+])
+
+tags_schema = StructType([
+    StructField("userId", IntegerType(), True),
+    StructField("movieId", IntegerType(), True),
+    StructField("tag", StringType(), True),
+    StructField("timestamp", LongType(), True)
+])
+
 
 def read_bronze_table(spark, table_name):
     """
@@ -44,6 +83,11 @@ def transform_links():
         links_df = read_bronze_table(
             spark,
             "bronze.links"
+        )
+
+        links_df = enforce_schema(
+            links_df,
+            links_schema
         )
 
         print("bronze.links loaded successfully")
@@ -114,6 +158,11 @@ def transform_movies():
         movies_df = read_bronze_table(
             spark,
             "bronze.movies"
+        )
+
+        movies_df = enforce_schema(
+            movies_df,
+            movies_schema
         )
 
         print("bronze.movies loaded successfully")
@@ -197,6 +246,11 @@ def transform_ratings():
             .load()
         )
 
+        ratings_df = enforce_schema(
+            ratings_df,
+            ratings_schema
+        )
+
         print("bronze.ratings loaded successfully")
         print(f"Number of Spark partitions:" f"{ratings_df.rdd.getNumPartitions()}")
 
@@ -209,6 +263,10 @@ def transform_ratings():
             .withColumnRenamed("userId", "UserId")
             .withColumnRenamed("movieId", "MovieId")
             .withColumnRenamed("rating", "Rating")
+            .withColumn(
+                "timestamp",
+                from_unixtime(col("timestamp")).cast("timestamp")
+            )
             .withColumnRenamed("timestamp", "Timestamp")
             .withColumn("CreateDtTm", current_timestamp())
             .withColumn("UpdateDtTm", current_timestamp())
@@ -271,6 +329,11 @@ def transform_tags():
             "bronze.tags"
         )
 
+        tags_df = enforce_schema(
+            tags_df,
+            tags_schema
+        )
+
         print("bronze.tags loaded successfully")
 
         source_row_count = tags_df.count()
@@ -283,6 +346,10 @@ def transform_tags():
             .withColumnRenamed("userId", "UserId")
             .withColumnRenamed("movieId", "MovieId")
             .withColumnRenamed("tag", "Tag")
+            .withColumn(
+                "timestamp",
+                from_unixtime(col("timestamp")).cast("timestamp")
+            )
             .withColumnRenamed("timestamp", "Timestamp")
             .withColumn("CreateDtTm", current_timestamp())
             .withColumn("UpdateDtTm", current_timestamp())

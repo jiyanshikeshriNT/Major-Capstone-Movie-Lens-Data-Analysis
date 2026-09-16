@@ -1,6 +1,7 @@
 import psycopg2
 
 from pyspark.sql import SparkSession
+from pyspark.sql.functions import col
 
 from src.python.config import (
     POSTGRES_HOST,
@@ -175,3 +176,30 @@ def get_table_row_count(table_name):
 
         if conn:
             conn.close()
+
+
+def enforce_schema(df, schema):
+
+    expected_columns = [
+        field.name
+        for field in schema.fields
+    ]
+
+    missing_columns = [
+        column
+        for column in expected_columns
+        if column not in df.columns
+    ]
+
+    if missing_columns:
+        raise ValueError(
+            f"Missing required columns: {missing_columns}"
+        )
+
+    for field in schema.fields:
+        df = df.withColumn(
+            field.name,
+            col(field.name).cast(field.dataType)
+        )
+
+    return df
