@@ -1,6 +1,7 @@
 import psycopg2
 
 from pyspark.sql import SparkSession
+from datetime import datetime
 
 from src.python.config import (
     POSTGRES_HOST,
@@ -170,6 +171,63 @@ def get_table_row_count(table_name):
 
     finally:
 
+        if cursor:
+            cursor.close()
+
+        if conn:
+            conn.close()
+
+
+def write_gold_transformation_log(
+    source_tables,
+    target_table,
+    status,
+    target_row_count=None,
+    error_message=None
+):
+    conn = None
+    cursor = None
+
+    try:
+        conn = get_postgres_connection()
+        cursor = conn.cursor()
+
+        query = """
+            INSERT INTO gold.transformation_log (
+                source_tables,
+                target_table,
+                status,
+                target_row_count,
+                error_message
+            )
+            VALUES (%s, %s, %s, %s, %s)
+        """
+
+        cursor.execute(
+            query,
+            (
+                source_tables,
+                target_table,
+                status,
+                target_row_count,
+                error_message
+            )
+        )
+
+        conn.commit()
+
+        print(
+            f"Gold transformation log written successfully "
+            f"for {target_table}"
+        )
+
+    except Exception as e:
+        print(
+            f"Failed to write Gold transformation log: {e}"
+        )
+        raise
+
+    finally:
         if cursor:
             cursor.close()
 
