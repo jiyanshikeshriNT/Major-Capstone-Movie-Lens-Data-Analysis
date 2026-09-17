@@ -27,162 +27,109 @@ def check_source_files():
     print("\nAll expected source files are available")
 
 
-#Ingesting links.csv table
-def ingest_links():
+#Generic ingestion function for single CSV files
+def ingest_csv(
+    file_name,
+    target_table,
+    csv_options=None
+):
 
     spark = create_spark_session()
 
     try:
-        links_path = str(DATA_DIR / "links.csv")
+        file_path = str(
+            DATA_DIR / file_name
+        )
 
-        links_df = (
+        reader = (
             spark.read
             .option("header", True)
             .option("inferSchema", True)
-            .csv(links_path)
         )
 
-        links_row_count = links_df.count()
+        if csv_options:
+            for option_name, option_value in csv_options.items():
+                reader = reader.option(
+                    option_name,
+                    option_value
+                )
+
+        df = reader.csv(file_path)
+
+        row_count = df.count()
 
         print(
-            f"links.csv row count: {links_row_count}"
+            f"{file_name} row count: {row_count}"
         )
 
-        links_df.write.jdbc(
+        df.write.jdbc(
             url=POSTGRES_URL,
-            table="bronze.links",
+            table=target_table,
             mode="overwrite",
             properties=POSTGRES_PROPERTIES
         )
 
         print(
-            "links.csv loaded successfully into bronze.links"
+            f"{file_name} loaded successfully "
+            f"into {target_table}"
         )
 
         write_ingestion_log(
-            "links.csv",
-            "bronze.links",
-            links_row_count,
+            file_name,
+            target_table,
+            row_count,
             "SUCCESS"
         )
 
     except Exception as e:
+
         write_ingestion_log(
-            "links.csv",
-            "bronze.links",
+            file_name,
+            target_table,
             0,
             "FAILED",
             str(e)
         )
+
         raise
+
     finally:
         spark.stop()
+
+
+#Ingesting links.csv table
+def ingest_links():
+
+    ingest_csv(
+        file_name="links.csv",
+        target_table="bronze.links"
+    )
 
 
 #Ingesting movies.csv table
 def ingest_movies():
 
-    spark = create_spark_session()
-    try:
-        movies_path = str(DATA_DIR / "movies.csv")
-        movies_df = (
-            spark.read
-            .option("header", True)
-            .option("inferSchema", True)
-            .option("quote", '"')
-            .option("escape", '"')
-            .csv(movies_path)
-        )
-
-        movies_row_count = movies_df.count()
-
-        print(
-            f"movies.csv row count: {movies_row_count}"
-        )
-
-        movies_df.write.jdbc(
-            url=POSTGRES_URL,
-            table="bronze.movies",
-            mode="overwrite",
-            properties=POSTGRES_PROPERTIES
-        )
-
-        print(
-            "movies.csv loaded successfully into bronze.movies"
-        )
-
-        write_ingestion_log(
-            "movies.csv",
-            "bronze.movies",
-            movies_row_count,
-            "SUCCESS"
-        )
-
-    except Exception as e:
-        write_ingestion_log(
-            "movies.csv",
-            "bronze.movies",
-            0,
-            "FAILED",
-            str(e)
-        )
-        raise
-    finally:
-        spark.stop()
+    ingest_csv(
+        file_name="movies.csv",
+        target_table="bronze.movies",
+        csv_options={
+            "quote": '"',
+            "escape": '"'
+        }
+    )
 
 
 #Ingesting tags.csv
 def ingest_tags():
 
-    spark = create_spark_session()
-
-    try:
-        tags_path = str(DATA_DIR / "tags.csv")
-
-        tags_df = (
-            spark.read
-            .option("header", True)
-            .option("inferSchema", True)
-            .option("quote", '"')
-            .option("escape", '"')
-            .csv(tags_path)
-        )
-
-        tags_row_count = tags_df.count()
-
-        print(
-            f"tags.csv row count: {tags_row_count}"
-        )
-
-        tags_df.write.jdbc(
-            url=POSTGRES_URL,
-            table="bronze.tags",
-            mode="overwrite",
-            properties=POSTGRES_PROPERTIES
-        )
-
-        print(
-            "tags.csv loaded successfully into bronze.tags"
-        )
-
-        write_ingestion_log(
-            "tags.csv",
-            "bronze.tags",
-            tags_row_count,
-            "SUCCESS"
-        )
-
-    except Exception as e:
-        write_ingestion_log(
-            "tags.csv",
-            "bronze.tags",
-            0,
-            "FAILED",
-            str(e)
-        )
-        raise
-    finally:
-        spark.stop()
+    ingest_csv(
+        file_name="tags.csv",
+        target_table="bronze.tags",
+        csv_options={
+            "quote": '"',
+            "escape": '"'
+        }
+    )
 
 
 
@@ -219,11 +166,10 @@ def ingest_ratings():
     spark = create_spark_session()
 
     ratings_files = [
-        "ratings_part1.csv",
-        "ratings_part2.csv",
-        "ratings_part3.csv",
-        "ratings_part4.csv",
-        "ratings_part5.csv"
+        file_name
+        for file_name in EXPECTED_FILES
+        if file_name.startswith("ratings_part")
+        and file_name.endswith(".csv")
     ]
 
     try:
