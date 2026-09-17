@@ -29,8 +29,11 @@ from pyspark.sql.functions import (
     col,
     concat_ws,
     collect_set,
-    from_unixtime
+    from_unixtime,
+    row_number
 )
+
+from pyspark.sql.window import Window
 
 # Expected schemas for Silver layer
 links_schema = StructType([
@@ -74,10 +77,56 @@ def read_bronze_table(spark, table_name):
     return df
 
 
-def transform_links():
+def rename_columns_to_pascal_case(df):
 
-    spark = create_spark_session()
-    spark.conf.set("spark.sql.session.timeZone", "UTC")
+    for column_name in df.columns:
+
+        pascal_case_name = "".join(
+            part[:1].upper() + part[1:]
+            for part in column_name.split("_")
+        )
+
+        df = df.withColumnRenamed(
+            column_name,
+            pascal_case_name
+        )
+
+    return df
+
+
+def deduplicate_data(
+    df,
+    key_cols=None,
+    order_col=None
+):
+
+    # Exact duplicate removal
+    if key_cols is None:
+        return df.dropDuplicates()
+
+    # Business-key deduplication:keeping latest record based on order_col
+    window_spec = (
+        Window
+        .partitionBy(*key_cols)
+        .orderBy(
+            col(order_col).desc()
+        )
+    )
+
+    return (
+        df
+        .withColumn(
+            "_row_num",
+            row_number().over(window_spec)
+        )
+        .filter(
+            col("_row_num") == 1
+        )
+        .drop("_row_num")
+    )
+
+
+def transform_links(spark):
 
     try:
         links_df = read_bronze_table(
@@ -93,18 +142,19 @@ def transform_links():
         print("bronze.links loaded successfully")
         print(f"Bronze links count: {links_df.count()}")
 
+        links_silver_df = deduplicate_data(links_df)
+
+        links_silver_df = rename_columns_to_pascal_case(
+            links_silver_df
+        )
+
         links_silver_df = (
-            links_df
-            .dropDuplicates()
-            .withColumnRenamed("movieId", "MovieId")
-            .withColumnRenamed("imdbId", "ImdbId")
-            .withColumnRenamed("tmdbId", "TmdbId")
+            links_silver_df
             .withColumn("CreateDtTm", current_timestamp())
             .withColumn("UpdateDtTm", current_timestamp())
         )
 
         links_silver_df.printSchema()
-        links_silver_df.show(5, truncate=False)
 
         source_row_count = links_df.count()
         target_row_count = links_silver_df.count()
@@ -144,14 +194,8 @@ def transform_links():
 
         raise
 
-    finally:
-        spark.stop()
 
-
-def transform_movies():
-
-    spark = create_spark_session()
-    spark.conf.set("spark.sql.session.timeZone", "UTC")
+def transform_movies(spark):
 
     try:
 
@@ -168,18 +212,19 @@ def transform_movies():
         print("bronze.movies loaded successfully")
         print(f"Bronze movies count: {movies_df.count()}")
 
+        movies_silver_df = deduplicate_data(movies_df)
+
+        movies_silver_df = rename_columns_to_pascal_case(
+            movies_silver_df
+        )
+
         movies_silver_df = (
-        movies_df
-            .dropDuplicates()
-            .withColumnRenamed("movieId", "MovieId")
-            .withColumnRenamed("title", "Title")
-            .withColumnRenamed("genres", "Genres")
+            movies_silver_df
             .withColumn("CreateDtTm", current_timestamp())
             .withColumn("UpdateDtTm", current_timestamp())
         )
 
         movies_silver_df.printSchema()
-        movies_silver_df.show(5, truncate=False)
 
         source_row_count = movies_df.count()
         target_row_count = movies_silver_df.count()
@@ -188,7 +233,7 @@ def transform_movies():
         print(f"Silver movies count: {target_row_count}")
 
         movies_silver_df.write.jdbc(
-             url=POSTGRES_URL,
+            url=POSTGRES_URL,
             table="silver.movies",
             mode="overwrite",
             properties=POSTGRES_PROPERTIES
@@ -219,14 +264,8 @@ def transform_movies():
 
         raise
 
-    finally:
-        spark.stop()
 
-
-def transform_ratings():
-
-    spark = create_spark_session()
-    spark.conf.set("spark.sql.session.timeZone", "UTC")
+def transform_ratings(spark):
 
     try:
         #Reading ratings file differently than other files, in chunks as it is huge
@@ -258,22 +297,38 @@ def transform_ratings():
 
         print(f"Bronze ratings count: {source_row_count}")
 
+        ratings_deduplicated_df = deduplicate_data(
+            ratings_df,
+            key_cols=[
+                "userId",
+                "movieId"
+            ],
+            order_col="timestamp"
+        )
+
+        ratings_silver_df = rename_columns_to_pascal_case(
+            ratings_deduplicated_df
+        )
+
         ratings_silver_df = (
-            ratings_df
-            .withColumnRenamed("userId", "UserId")
-            .withColumnRenamed("movieId", "MovieId")
-            .withColumnRenamed("rating", "Rating")
+            ratings_silver_df
             .withColumn(
-                "timestamp",
-                from_unixtime(col("timestamp")).cast("timestamp")
+                "Timestamp",
+                from_unixtime(
+                    col("Timestamp")
+                ).cast("timestamp")
             )
-            .withColumnRenamed("timestamp", "Timestamp")
-            .withColumn("CreateDtTm", current_timestamp())
-            .withColumn("UpdateDtTm", current_timestamp())
+            .withColumn(
+                "CreateDtTm",
+                current_timestamp()
+            )
+            .withColumn(
+                "UpdateDtTm",
+                current_timestamp()
+            )
         )
 
         ratings_silver_df.printSchema()
-        ratings_silver_df.show(5, truncate=False)
 
         target_row_count = ratings_silver_df.count()
         bad_row_count = source_row_count - target_row_count
@@ -312,15 +367,8 @@ def transform_ratings():
 
         raise
 
-    finally:
 
-        spark.stop()
-
-
-def transform_tags():
-
-    spark = create_spark_session()
-    spark.conf.set("spark.sql.session.timeZone", "UTC")
+def transform_tags(spark):
 
     try:
 
@@ -340,23 +388,31 @@ def transform_tags():
 
         print(f"Bronze tags count: {source_row_count}")
 
+        tags_silver_df = deduplicate_data(tags_df)
+
+        tags_silver_df = rename_columns_to_pascal_case(
+            tags_silver_df
+        )
+
         tags_silver_df = (
-            tags_df
-            .dropDuplicates()
-            .withColumnRenamed("userId", "UserId")
-            .withColumnRenamed("movieId", "MovieId")
-            .withColumnRenamed("tag", "Tag")
+            tags_silver_df
             .withColumn(
-                "timestamp",
-                from_unixtime(col("timestamp")).cast("timestamp")
+                "Timestamp",
+                from_unixtime(
+                    col("Timestamp")
+                ).cast("timestamp")
             )
-            .withColumnRenamed("timestamp", "Timestamp")
-            .withColumn("CreateDtTm", current_timestamp())
-            .withColumn("UpdateDtTm", current_timestamp())
+            .withColumn(
+                "CreateDtTm",
+                current_timestamp()
+            )
+            .withColumn(
+                "UpdateDtTm",
+                current_timestamp()
+            )
         )
 
         tags_silver_df.printSchema()
-        tags_silver_df.show(5, truncate=False)
 
         target_row_count = tags_silver_df.count()
         bad_row_count = source_row_count - target_row_count
@@ -395,15 +451,8 @@ def transform_tags():
 
         raise
 
-    finally:
 
-        spark.stop()
-
-
-def transform_movie_metadata():
-
-    spark = create_spark_session()
-    spark.conf.set("spark.sql.session.timeZone", "UTC")
+def transform_movie_metadata(spark):
 
     try:
         # Reading existing Silver tables
@@ -498,7 +547,6 @@ def transform_movie_metadata():
         )
 
         movie_metadata_df.printSchema()
-        movie_metadata_df.show(5, truncate=False)
 
         target_row_count = movie_metadata_df.count()
 
@@ -542,15 +590,8 @@ def transform_movie_metadata():
 
         raise
 
-    finally:
 
-        spark.stop()
-
-
-def transform_user_ratings_master():
-
-    spark = create_spark_session()
-    spark.conf.set("spark.sql.session.timeZone", "UTC")
+def transform_user_ratings_master(spark):
 
     try:
 
@@ -798,46 +839,51 @@ def transform_user_ratings_master():
 
         raise
 
-    finally:
-
-        spark.stop()
-
 if __name__ == "__main__":
 
-    if len(sys.argv) == 1:
+    spark = create_spark_session()
+    spark.conf.set(
+        "spark.sql.session.timeZone",
+        "UTC"
+    )
 
-        # Run complete Silver pipeline manually
-        transform_links()
-        transform_movies()
-        transform_ratings()
-        transform_tags()
-        transform_movie_metadata()
-        transform_user_ratings_master()
+    try:
 
-
-    else:
-
-        task_name = sys.argv[1]
-
-        if task_name == "transform_links":
-            transform_links()
-
-        elif task_name == "transform_movies":
-            transform_movies()
-
-        elif task_name == "transform_ratings":
-            transform_ratings()
-
-        elif task_name == "transform_tags":
-            transform_tags()
-
-        elif task_name == "transform_movie_metadata":
-            transform_movie_metadata()
-
-        elif task_name == "transform_user_ratings_master":
-            transform_user_ratings_master()
+        if len(sys.argv) == 1:
+            # Run complete Silver pipeline manually
+            transform_links(spark)
+            transform_movies(spark)
+            transform_ratings(spark)
+            transform_tags(spark)
+            transform_movie_metadata(spark)
+            transform_user_ratings_master(spark)
 
         else:
-            raise ValueError(
-                f"Unknown task: {task_name}"
-            )
+
+            task_name = sys.argv[1]
+
+            if task_name == "transform_links":
+                transform_links(spark)
+
+            elif task_name == "transform_movies":
+                transform_movies(spark)
+
+            elif task_name == "transform_ratings":
+                transform_ratings(spark)
+
+            elif task_name == "transform_tags":
+                transform_tags(spark)
+
+            elif task_name == "transform_movie_metadata":
+                transform_movie_metadata(spark)
+
+            elif task_name == "transform_user_ratings_master":
+                transform_user_ratings_master(spark)
+
+            else:
+                raise ValueError(
+                    f"Unknown task: {task_name}"
+                )
+        
+    finally:
+        spark.stop()
