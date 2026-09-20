@@ -20,7 +20,11 @@ Target columns:
 - CreateDtTm
 - UpdateDtTm
 
-The table is written to PostgreSQL using overwrite mode.
+`MovieId` is used as the business key for `silver.movie_metadata`.
+
+The transformed data is loaded into PostgreSQL using the staging-based UPSERT process. A unique index on `MovieId` ensures that repeated pipeline executions do not create duplicate movie metadata records.
+
+New movie records are inserted, while existing records are updated only when the relevant business data has changed. `CreateDtTm` is preserved for existing records during subsequent UPSERT operations.
 
 Data Flow:
 
@@ -67,7 +71,13 @@ Example batch ranges:
 - UserId 50001–75000
 - and so on
 
-The first batch writes the target table using overwrite mode, while subsequent batches use append mode.
+The combination of `UserId` and `MovieId` is used as the business key for `silver.user_ratings_master`.
+
+Each processed batch is loaded using the staging-based PostgreSQL UPSERT process instead of replacing the complete target table.
+
+A unique index on `(UserId, MovieId)` ensures that repeated pipeline executions do not create duplicate master records. New records are inserted, while existing records are updated only when the relevant business data has changed.
+
+`CreateDtTm` is preserved for existing records during subsequent UPSERT operations.
 
 
 ## Audit Logging

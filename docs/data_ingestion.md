@@ -75,7 +75,13 @@ The main Bronze ingestion logic is implemented in:
 src/pyspark/ingest_bronze.py
 ```
 
-The ingestion script contains separate functions for each step of the Bronze pipeline:
+The ingestion script uses a reusable generic ingestion function for loading CSV files into PostgreSQL:
+
+```text
+ingest_csv()
+```
+
+The main Bronze pipeline functions are:
 
 ```text
 check_source_files()
@@ -86,7 +92,13 @@ ingest_ratings()
 validate_bronze()
 ```
 
-Keeping the ingestion operations in separate functions allows each step to be executed independently by Apache Airflow.
+The `ingest_csv()` function contains the common CSV reading, PostgreSQL JDBC writing, row counting, and ingestion logging logic.
+
+The source-specific ingestion functions call this reusable function with the appropriate file name and target table.
+
+The ratings ingestion is coordinated separately because the ratings dataset is divided into five source files and each file is loaded sequentially into the same Bronze table.
+
+Keeping the ingestion operations in separate functions also allows each step to be executed independently by Apache Airflow.
 
 ---
 
@@ -237,17 +249,17 @@ The `links.csv` source file is ingested into:
 bronze.links
 ```
 
-The PySpark DataFrame is created using the defined schema and the CSV header.
+The file is loaded through the reusable `ingest_csv()` function and written to PostgreSQL using Spark JDBC.
 
-The row count is calculated before writing the data.
-
-The data is then written into PostgreSQL using Spark JDBC.
-
-The links table uses:
+The Bronze layer preserves ingested raw data and therefore uses:
 
 ```text
-mode = overwrite
+mode = append
 ```
+
+The links table is not truncated before ingestion. Therefore, repeated executions may result in repeated raw records in the Bronze layer.
+
+These records are intentionally retained at the Bronze level, while duplicate handling is performed during the Silver transformation process.
 
 After successful ingestion, an entry is written into `bronze.ingestion_log`.
 
@@ -269,15 +281,17 @@ title
 genres
 ```
 
-The PySpark DataFrame is created using an explicit schema.
-
-The row count is calculated and the data is written into PostgreSQL using JDBC.
+The file is loaded through the reusable `ingest_csv()` function and written to PostgreSQL using Spark JDBC.
 
 The movies table uses:
 
 ```text
-mode = overwrite
+mode = append
 ```
+
+The movies table is not truncated before ingestion. Therefore, repeated pipeline executions may preserve repeated raw records in the Bronze layer.
+
+Duplicate records are identified and handled during the Silver-layer transformation process.
 
 After successful ingestion, an ingestion log entry is created.
 
@@ -300,13 +314,27 @@ tag
 timestamp
 ```
 
-The data is read using PySpark with an explicitly defined schema.
+Before loading the source file, the existing `bronze.tags` table is truncated.
 
-The tags table uses:
+The ingestion flow is:
 
 ```text
-mode = overwrite
+Truncate bronze.tags
+        ↓
+Read tags.csv
+        ↓
+Append Source Data
+        ↓
+bronze.tags
 ```
+
+The data is written using:
+
+```text
+mode = append
+```
+
+Truncating the table before ingestion prevents the complete tags dataset from accumulating again on every full pipeline execution.
 
 After the data is successfully written to PostgreSQL, the ingestion event is recorded in `bronze.ingestion_log`.
 
@@ -330,60 +358,68 @@ All five files are loaded into one PostgreSQL table:
 bronze.ratings
 ```
 
-Unlike the other source files, ratings use:
+Because the ratings dataset is very large, the source files are processed sequentially rather than being combined into one large DataFrame before writing.
+
+At the beginning of the ratings ingestion process, the existing `bronze.ratings` table is truncated.
+
+The five ratings files are then processed in order and appended to the same Bronze table:
+
+```text
+Truncate bronze.ratings
+          ↓
+ratings_part1.csv → Append
+          ↓
+ratings_part2.csv → Append
+          ↓
+ratings_part3.csv → Append
+          ↓
+ratings_part4.csv → Append
+          ↓
+ratings_part5.csv → Append
+          ↓
+bronze.ratings
+```
+
+Each ratings part is loaded sequentially using:
 
 ```text
 mode = append
 ```
 
-This allows each ratings file to be added incrementally to the existing Bronze ratings table.
+This approach keeps the ingestion manageable and demonstrates file-by-file incremental loading within a complete ratings reload.
 
-The process is:
-
-```text
-ratings_part1.csv
-        ↓
-bronze.ratings
-        ↑
-ratings_part2.csv
-        ↑
-ratings_part3.csv
-        ↑
-ratings_part4.csv
-        ↑
-ratings_part5.csv
-```
-
-Therefore, five separate source files contribute data to one Bronze ratings table.
+Truncating the table once before processing the five files prevents the complete ratings dataset from being duplicated across repeated full pipeline executions.
 
 ---
 
-## 14. Duplicate Prevention for Ratings
+## 14. Bronze Reload Strategy
 
-Before loading each ratings file, the pipeline checks whether that file has already been successfully ingested.
+The Bronze ingestion strategy depends on the size and ingestion behavior of each source dataset.
 
-This check is performed using:
+### Links and Movies
+
+`links` and `movies` use append-based ingestion without truncating their existing Bronze tables.
+
+This allows the Bronze layer to preserve repeated raw ingestions. Duplicate records are identified and handled in the Silver layer.
+
+### Tags
+
+Because the complete tags dataset is reprocessed during each pipeline execution, `bronze.tags` is truncated before the source file is appended.
+
+### Ratings
+
+Because ratings contain approximately 32 million rows across five source files, `bronze.ratings` is truncated once before the five ratings parts are sequentially appended.
+
+The Bronze ingestion strategy can therefore be summarized as:
 
 ```text
-bronze.ingestion_log
+links    → Append
+movies   → Append
+tags     → Truncate + Append
+ratings  → Truncate + Sequential Append
 ```
 
-The pipeline searches for a successful ingestion record containing:
-
-- The same file name
-- Target table `bronze.ratings`
-- Status `SUCCESS`
-
-If the file has already been successfully loaded, the pipeline skips that file.
-
-Example:
-
-```text
-ratings_part1.csv was already successfully loaded
-Skipping file to prevent duplicate records
-```
-
-This prevents the same ratings file from being appended multiple times during repeated pipeline executions.
+This prevents unnecessary growth of the larger Bronze tables while keeping duplicate handling and data-quality processing primarily within the Silver layer.
 
 ---
 
@@ -714,24 +750,27 @@ This prevents sensitive credentials from being pushed to the GitHub repository.
 The complete Bronze ingestion flow is:
 
 ```text
-                    MovieLens Raw CSV Files
-                              ↓
-                    Check Source Files
-                              ↓
-                         ingest_links
-                              ↓
-                        ingest_movies
-                              ↓
-                         ingest_tags
-                              ↓
-                       ingest_ratings
-                    (Incremental Load)
-                              ↓
-                      validate_bronze
-                              ↓
-                 PostgreSQL Bronze Layer
-                              ↓
-                 Ready for Silver Layer
+                    MovieLens Raw CSV Files
+                              ↓
+                    Check Source Files
+                              ↓
+                         ingest_links
+                          (Append)
+                              ↓
+                        ingest_movies
+                          (Append)
+                              ↓
+                         ingest_tags
+                    (Truncate + Append)
+                              ↓
+                       ingest_ratings
+              (Truncate + Sequential Append)
+                              ↓
+                      validate_bronze
+                              ↓
+                 PostgreSQL Bronze Layer
+                              ↓
+        Silver Deduplication & Transformation
 ```
 
 ---
