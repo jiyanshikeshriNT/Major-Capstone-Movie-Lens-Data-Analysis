@@ -33,6 +33,10 @@ def create_spark_session():
             "spark.jars",
             "drivers/postgresql-42.7.13.jar"
         )
+        .config(
+            "spark.sql.session.timeZone",
+            "UTC"
+        )
         .getOrCreate()
     )
 

@@ -33,7 +33,8 @@ from pyspark.sql.functions import (
     collect_set,
     sort_array,
     from_unixtime,
-    row_number
+    row_number,
+    lit
 )
 
 from pyspark.sql.window import Window
@@ -292,7 +293,10 @@ def upsert_to_postgres(
                 column_name
                 for column_name in all_columns
                 if column_name not in key_columns
-                and column_name != "CreateDtTm"
+                and column_name not in [
+                    "CreateDtTm",
+                    "QuarantinedDtTm"
+                ]
             ]
 
             # Columns that is used to determine whether the business data has actually changed
@@ -423,6 +427,57 @@ def upsert_to_postgres(
         conn.close()
 
 
+def write_to_quarantine(
+    df,
+    target_table,
+    key_columns
+):
+
+    quarantine_row_count = df.count()
+
+    if quarantine_row_count == 0:
+
+        print(
+            f"No rows to quarantine for "
+            f"{target_table}"
+        )
+
+        return 0
+
+    print(
+        f"Unique rejected rows identified "
+        f"for {target_table}: "
+        f"{quarantine_row_count}"
+    )
+
+    # Add quarantine audit timestamp
+    quarantine_df = (
+        df
+        .withColumn(
+            "QuarantinedDtTm",
+            current_timestamp()
+        )
+    )
+
+    # Using UPSERT so rerunning the Silver DAG does not repeatedly store the same rejected record
+    upsert_to_postgres(
+        df=quarantine_df,
+        target_table=target_table,
+        key_columns=key_columns
+    )
+
+    final_count = get_table_row_count(
+        target_table
+    )
+
+    print(
+        f"{target_table} total row count: "
+        f"{final_count}"
+    )
+
+    return quarantine_row_count
+
+
 def transform_links(spark):
 
     try:
@@ -444,14 +499,55 @@ def transform_links(spark):
             f"{source_row_count}"
         )
 
-        # Removing Bronze duplicates using MovieId as the business key
-        links_deduplicated_df = deduplicate_data(
-            links_df,
-            key_cols=["movieId"]
+        # Rank records having the same MovieId. One record will be retained for Silver and the remaining duplicate records will be identified for quarantine
+        links_window = (
+            Window
+            .partitionBy("movieId")
+            .orderBy(
+                col("imdbId").asc_nulls_last(),
+                col("tmdbId").asc_nulls_last()
+            )
+        )
+
+        links_ranked_df = (
+            links_df
+            .withColumn(
+                "_row_num",
+                row_number().over(links_window)
+            )
+        )
+
+        # Keeping one record for each MovieId in Silver
+        links_deduplicated_df = (
+            links_ranked_df
+            .filter(
+                col("_row_num") == 1
+            )
+            .drop("_row_num")
         )
 
         deduplicated_row_count = (
             links_deduplicated_df.count()
+        )
+
+        # Identifying the actual records rejected during deduplication
+        links_quarantine_df = (
+            links_ranked_df
+            .filter(
+                col("_row_num") > 1
+            )
+            .drop("_row_num")
+            .dropDuplicates(
+                [
+                    "movieId",
+                    "imdbId",
+                    "tmdbId"
+                ]
+            )
+            .withColumn(
+                "Reason",
+                lit("DUPLICATE_MOVIE_ID")
+            )
         )
 
         print(
@@ -480,6 +576,23 @@ def transform_links(spark):
         print(
             f"Duplicate links removed: "
             f"{bad_row_count}"
+        )
+
+        # Storing unique rejected duplicate records in the quarantine layer
+        quarantined_row_count = write_to_quarantine(
+            df=links_quarantine_df,
+            target_table="quarantine.links",
+            key_columns=[
+                "movieId",
+                "imdbId",
+                "tmdbId",
+                "Reason"
+            ]
+        )
+
+        print(
+            f"Unique links records stored in "
+            f"quarantine: {quarantined_row_count}"
         )
 
         # Upsert cleaned data into Silver
@@ -549,11 +662,55 @@ def transform_movies(spark):
             f"{source_row_count}"
         )
 
-        # Remove Bronze duplicates using MovieId
-        # as the business key
-        movies_deduplicated_df = deduplicate_data(
-            movies_df,
-            key_cols=["movieId"]
+        # Ranking records having the same MovieId. One record will be retained for Silver and remaining duplicate records will be quarantined
+        movies_window = (
+            Window
+            .partitionBy("movieId")
+            .orderBy(
+                col("title").asc_nulls_last(),
+                col("genres").asc_nulls_last()
+            )
+        )
+
+        movies_ranked_df = (
+            movies_df
+            .withColumn(
+                "_row_num",
+                row_number().over(movies_window)
+            )
+        )
+
+        # Keeping one record per MovieId for Silver
+        movies_deduplicated_df = (
+            movies_ranked_df
+            .filter(
+                col("_row_num") == 1
+            )
+            .drop("_row_num")
+        )
+
+        deduplicated_row_count = (
+            movies_deduplicated_df.count()
+        )
+
+        # Storing only unique rejected duplicate records
+        movies_quarantine_df = (
+            movies_ranked_df
+            .filter(
+                col("_row_num") > 1
+            )
+            .drop("_row_num")
+            .dropDuplicates(
+                [
+                    "movieId",
+                    "title",
+                    "genres"
+                ]
+            )
+            .withColumn(
+                "Reason",
+                lit("DUPLICATE_MOVIE_ID")
+            )
         )
 
         deduplicated_row_count = (
@@ -586,6 +743,22 @@ def transform_movies(spark):
         print(
             f"Duplicate movies removed: "
             f"{bad_row_count}"
+        )
+
+        quarantined_row_count = write_to_quarantine(
+            df=movies_quarantine_df,
+            target_table="quarantine.movies",
+            key_columns=[
+                "movieId",
+                "title",
+                "genres",
+                "Reason"
+            ]
+        )
+
+        print(
+            f"Unique movie records stored in "
+            f"quarantine: {quarantined_row_count}"
         )
 
         # Upsert cleaned data into Silver
@@ -665,14 +838,59 @@ def transform_ratings(spark):
 
         print(f"Bronze ratings count: {source_row_count}")
 
-        ## Keep only the latest rating for each UserId + MovieId combination
-        ratings_deduplicated_df = deduplicate_data(
-            ratings_df,
-            key_cols=[
+        # Keep only the latest rating for each UserId + MovieId combination
+        # Rank ratings for each UserId + MovieId and Latest rating will be retained in Silver
+        ratings_window = (
+            Window
+            .partitionBy(
                 "userId",
                 "movieId"
-            ],
-            order_col="timestamp"
+            )
+            .orderBy(
+                col("timestamp").desc()
+            )
+        )
+
+        ratings_ranked_df = (
+            ratings_df
+            .withColumn(
+                "_row_num",
+                row_number().over(ratings_window)
+            )
+        )
+
+        # Keeping latest rating for Silver
+        ratings_deduplicated_df = (
+            ratings_ranked_df
+            .filter(
+                col("_row_num") == 1
+            )
+            .drop("_row_num")
+        )
+
+        deduplicated_row_count = (
+            ratings_deduplicated_df.count()
+        )
+
+        # Older duplicate ratings are rejected
+        ratings_quarantine_df = (
+            ratings_ranked_df
+            .filter(
+                col("_row_num") > 1
+            )
+            .drop("_row_num")
+            .dropDuplicates(
+                [
+                    "userId",
+                    "movieId",
+                    "rating",
+                    "timestamp"
+                ]
+            )
+            .withColumn(
+                "Reason",
+                lit("OLDER_DUPLICATE_RATING")
+            )
         )
 
         deduplicated_row_count = (
@@ -717,6 +935,23 @@ def transform_ratings(spark):
         print(
             f"Duplicate ratings removed: "
             f"{bad_row_count}"
+        )
+
+        quarantined_row_count = write_to_quarantine(
+            df=ratings_quarantine_df,
+            target_table="quarantine.ratings",
+            key_columns=[
+                "userId",
+                "movieId",
+                "rating",
+                "timestamp",
+                "Reason"
+            ]
+        )
+
+        print(
+            f"Unique rating records stored in "
+            f"quarantine: {quarantined_row_count}"
         )
 
         # Upsert cleaned ratings into Silver = UserId + MovieId identifies one user's current rating for a movie
@@ -787,11 +1022,60 @@ def transform_tags(spark):
 
         print(f"Bronze tags count: {source_row_count}")
 
-        # Removing exact duplicate tag events
-        tags_deduplicated_df = deduplicate_data(tags_df)
+        # Ranking exact duplicate tag records. One copy will be retained for Silver and remaining copies will be identified for quarantine
+        tags_window = (
+            Window
+            .partitionBy(
+                "userId",
+                "movieId",
+                "tag",
+                "timestamp"
+            )
+            .orderBy(
+                col("timestamp").desc()
+            )
+        )
+
+        tags_ranked_df = (
+            tags_df
+            .withColumn(
+                "_row_num",
+                row_number().over(tags_window)
+            )
+        )
+
+        # Keeping one copy of each exact tag record for Silver
+        tags_deduplicated_df = (
+            tags_ranked_df
+            .filter(
+                col("_row_num") == 1
+            )
+            .drop("_row_num")
+        )
 
         deduplicated_row_count = (
             tags_deduplicated_df.count()
+        )
+
+        # Identifying exact duplicate records rejected from Silver
+        tags_quarantine_df = (
+            tags_ranked_df
+            .filter(
+                col("_row_num") > 1
+            )
+            .drop("_row_num")
+            .dropDuplicates(
+                [
+                    "userId",
+                    "movieId",
+                    "tag",
+                    "timestamp"
+                ]
+            )
+            .withColumn(
+                "Reason",
+                lit("EXACT_DUPLICATE_TAG")
+            )
         )
 
         print(
@@ -832,6 +1116,24 @@ def transform_tags(spark):
         print(
             f"Duplicate tags removed: "
             f"{bad_row_count}"
+        )
+
+        # Store unique rejected duplicate tag records in the quarantine layer
+        quarantined_row_count = write_to_quarantine(
+            df=tags_quarantine_df,
+            target_table="quarantine.tags",
+            key_columns=[
+                "userId",
+                "movieId",
+                "tag",
+                "timestamp",
+                "Reason"
+            ]
+        )
+
+        print(
+            f"Unique tag records stored in "
+            f"quarantine: {quarantined_row_count}"
         )
 
         # Upsert cleaned tag events into Silver
