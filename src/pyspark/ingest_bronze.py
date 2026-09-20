@@ -29,12 +29,11 @@ def check_source_files():
 
 #Generic ingestion function for single CSV files
 def ingest_csv(
+    spark,
     file_name,
     target_table,
     csv_options=None
 ):
-
-    spark = create_spark_session()
 
     try:
         file_path = str(
@@ -65,7 +64,7 @@ def ingest_csv(
         df.write.jdbc(
             url=POSTGRES_URL,
             table=target_table,
-            mode="overwrite",
+            mode="append",
             properties=POSTGRES_PROPERTIES
         )
 
@@ -93,23 +92,72 @@ def ingest_csv(
 
         raise
 
+
+#Truncating large bronzee tables which have huge amount of data before every dag trigger
+def truncate_bronze_table(table_name):
+
+    conn = get_postgres_connection()
+    cursor = conn.cursor()
+
+    try:
+
+        # Checking whether the table already exists
+        cursor.execute(
+            "SELECT to_regclass(%s)",
+            (f"bronze.{table_name}",)
+        )
+
+        table_exists = cursor.fetchone()[0]
+
+        if table_exists:
+
+            print(
+                f"\nTruncating bronze.{table_name}"
+            )
+
+            cursor.execute(
+                f'TRUNCATE TABLE bronze."{table_name}"'
+            )
+
+            conn.commit()
+
+            print(
+                f"bronze.{table_name} truncated successfully"
+            )
+
+        else:
+
+            print(
+                f"\nbronze.{table_name} does not exist yet. "
+                "Skipping truncate."
+            )
+
+    except Exception:
+
+        conn.rollback()
+        raise
+
     finally:
-        spark.stop()
+
+        cursor.close()
+        conn.close()
 
 
 #Ingesting links.csv table
-def ingest_links():
+def ingest_links(spark):
 
     ingest_csv(
+        spark=spark,
         file_name="links.csv",
         target_table="bronze.links"
     )
 
 
 #Ingesting movies.csv table
-def ingest_movies():
+def ingest_movies(spark):
 
     ingest_csv(
+        spark=spark,
         file_name="movies.csv",
         target_table="bronze.movies",
         csv_options={
@@ -120,9 +168,13 @@ def ingest_movies():
 
 
 #Ingesting tags.csv
-def ingest_tags():
+def ingest_tags(spark):
+
+    #Tags contains around 2M rows, therefore clearing existing data before reloading to avoid unecessary growth
+    truncate_bronze_table("tags")
 
     ingest_csv(
+        spark=spark,
         file_name="tags.csv",
         target_table="bronze.tags",
         csv_options={
@@ -132,105 +184,31 @@ def ingest_tags():
     )
 
 
-
-#Checking if ratings file hasalready been loaded
-def is_file_already_loaded(file_name):
-
-    conn = get_postgres_connection()
-    cursor = conn.cursor()
-
-    query = """
-        SELECT COUNT(*)
-        FROM bronze.ingestion_log
-        WHERE file_name = %s
-          AND target_table = 'bronze.ratings'
-          AND status = 'SUCCESS'
-    """
-
-    cursor.execute(
-        query,
-        (file_name,)
-    )
-
-    count = cursor.fetchone()[0]
-
-    cursor.close()
-    conn.close()
-
-    return count > 0
-
-
 #Ingesting ratings.csv increamentally
-def ingest_ratings():
+def ingest_ratings(spark):
 
-    spark = create_spark_session()
+    #Ratings conatins around 32M rows, clearing existing data before loading all rating parts.
+    truncate_bronze_table("ratings")
 
-    ratings_files = [
+    ratings_files = sorted([
         file_name
         for file_name in EXPECTED_FILES
         if file_name.startswith("ratings_part")
         and file_name.endswith(".csv")
-    ]
+    ])
 
-    try:
-        for file_name in ratings_files:
-            print(f"\nProcessing {file_name}")
-            if is_file_already_loaded(file_name):
+    for file_name in ratings_files:
 
-                print(
-                    f"{file_name} was already successfully loaded"
-                )
-
-                print(
-                    "Skipping file to prevent duplicate records"
-                )
-
-                continue
-
-            ratings_path = str(
-                DATA_DIR / file_name
-            )
-
-            ratings_df = (
-                spark.read
-                .option("header", True)
-                .option("inferSchema", True)
-                .csv(ratings_path)
-            )
-
-            ratings_row_count = ratings_df.count()
-
-            print(
-                f"{file_name} row count: "
-                f"{ratings_row_count}"
-            )
-
-            ratings_df.write.jdbc(
-                url=POSTGRES_URL,
-                table="bronze.ratings",
-                mode="append",
-                properties=POSTGRES_PROPERTIES
-            )
-
-            print(
-                f"{file_name} loaded successfully "
-                "into bronze.ratings"
-            )
-
-            write_ingestion_log(
-                file_name,
-                "bronze.ratings",
-                ratings_row_count,
-                "SUCCESS"
-            )
-
-    except Exception as e:
         print(
-            f"Ratings ingestion failed: {e}"
+            f"\nProcessing {file_name}"
         )
-        raise
-    finally:
-        spark.stop()
+
+        # Each ratings part is loaded sequentially
+        ingest_csv(
+            spark=spark,
+            file_name=file_name,
+            target_table="bronze.ratings"
+        )
 
 
 #Valdating bronze tables
@@ -247,27 +225,27 @@ def validate_bronze():
     ]
 
     print("\nValidating Bronze tables")
-    for table_name in tables:
-        cursor.execute(
-            f'SELECT COUNT(*) FROM bronze."{table_name}"'
-        )
-
-        row_count = cursor.fetchone()[0]
-        print(
-            f"bronze.{table_name}: "
-            f"{row_count} rows"
-        )
-
-        if row_count == 0:
-            cursor.close()
-            conn.close()
-            raise ValueError(
-                f"Validation failed: "
-                f"bronze.{table_name} contains 0 rows"
+    try:
+        for table_name in tables:
+            cursor.execute(
+                f'SELECT COUNT(*) FROM bronze."{table_name}"'
             )
 
-    cursor.close()
-    conn.close()
+            row_count = cursor.fetchone()[0]
+            print(
+                f"bronze.{table_name}: "
+                f"{row_count} rows"
+            )
+
+            if row_count == 0:
+                raise ValueError(
+                    f"Validation failed: "
+                    f"bronze.{table_name} contains 0 rows"
+                )
+
+    finally:
+        cursor.close()
+        conn.close()
 
     print(
         "\nBronze validation completed successfully."
@@ -279,10 +257,17 @@ if __name__ == "__main__":
     if len(sys.argv) == 1:
         # Run complete Bronze pipeline manually
         check_source_files()
-        ingest_links()
-        ingest_movies()
-        ingest_tags()
-        ingest_ratings()
+        spark = create_spark_session()
+        try:
+            ingest_links(spark)
+            ingest_movies(spark)
+            ingest_tags(spark)
+            ingest_ratings(spark)
+
+        finally:
+            spark.stop()
+
+
         validate_bronze()
 
     else:
@@ -291,20 +276,37 @@ if __name__ == "__main__":
         if task_name == "check_source_files":
             check_source_files()
 
-        elif task_name == "ingest_links":
-            ingest_links()
-
-        elif task_name == "ingest_movies":
-            ingest_movies()
-
-        elif task_name == "ingest_tags":
-            ingest_tags()
-
-        elif task_name == "ingest_ratings":
-            ingest_ratings()
-
         elif task_name == "validate_bronze":
             validate_bronze()
+
+        elif task_name in [
+            "ingest_links",
+            "ingest_movies",
+            "ingest_tags",
+            "ingest_ratings"
+        ]:
+
+            spark = create_spark_session()
+
+            try:
+
+                if task_name == "ingest_links":
+                    ingest_links(spark)
+
+
+                elif task_name == "ingest_movies":
+                    ingest_movies(spark)
+
+
+                elif task_name == "ingest_tags":
+                    ingest_tags(spark)
+
+
+                elif task_name == "ingest_ratings":
+                    ingest_ratings(spark)
+
+            finally:
+                spark.stop()
 
         else:
             raise ValueError(f"Unknown task: {task_name}")  
