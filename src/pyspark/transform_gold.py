@@ -69,7 +69,7 @@ def transform_movie_insight():
             .option("partitionColumn", "UserId")
             .option("lowerBound", "1")
             .option("upperBound", "200948")
-            .option("numPartitions", "32")
+            .option("numPartitions", "16")
             .option("fetchsize", "10000")
             .load()
         )

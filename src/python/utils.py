@@ -37,6 +37,22 @@ def create_spark_session():
             "spark.sql.session.timeZone",
             "UTC"
         )
+        .config(
+            "spark.driver.memory",
+            "2g"
+        )
+        .config(
+            "spark.sql.shuffle.partitions",
+            "64"
+        )
+        .config(
+            "spark.sql.adaptive.enabled",
+            "true"
+        )
+        .config(
+            "spark.sql.adaptive.coalescePartitions.enabled",
+            "true"
+        )
         .getOrCreate()
     )
 
