@@ -2,6 +2,7 @@ from datetime import datetime, timedelta
 
 from airflow import DAG
 from airflow.operators.bash import BashOperator
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
 # Default configuration for DAG tasks
 default_args = {
@@ -69,6 +70,12 @@ with DAG(
         """
     )
 
+    trigger_silver_dag = TriggerDagRunOperator(
+        task_id="trigger_silver_dag",
+        trigger_dag_id="movielens_silver_transformation",
+        wait_for_completion=False
+    )
+
     (
         check_source_files
         >> ingest_links
@@ -76,4 +83,5 @@ with DAG(
         >> ingest_tags
         >> ingest_ratings
         >> validate_bronze
+        >> trigger_silver_dag
     )
