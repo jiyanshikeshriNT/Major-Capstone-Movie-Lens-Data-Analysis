@@ -83,5 +83,5 @@ with DAG(
         >> ingest_tags
         >> ingest_ratings
         >> validate_bronze
-        >> trigger_silver_dag
+        >> trigger_silver_dag       
     )

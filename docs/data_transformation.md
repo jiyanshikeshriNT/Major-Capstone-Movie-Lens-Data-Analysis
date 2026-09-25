@@ -6,6 +6,10 @@ The Silver layer contains cleaned, standardized, and validated data created from
 
 The Bronze tables are read from PostgreSQL using PySpark, transformed according to the required standards, and written into the `silver` schema in PostgreSQL.
 
+Silver tables are maintained using an idempotent PostgreSQL UPSERT strategy instead of replacing the complete target table during every execution.
+
+Incoming transformed data is first deduplicated according to the business key. Rejected duplicate records are identified for the Quarantine layer, while valid records are merged into the Silver tables using staging tables, unique indexes, and PostgreSQL `ON CONFLICT` handling.
+
 The Silver transformation process is orchestrated using Apache Airflow. The Silver DAG is automatically triggered after successful completion of the Bronze ingestion DAG.
 
 ---
@@ -32,6 +36,17 @@ The transformed data is stored in:
 
 ---
 
+### Quarantine Schema
+
+Rejected duplicate records identified during Silver processing are stored, when applicable, in:
+
+- `quarantine.links`
+- `quarantine.movies`
+- `quarantine.ratings`
+- `quarantine.tags`
+
+Quarantine tables are created when rejected records are available for the corresponding dataset.
+
 ## 3. Transformation Process
 
 The Silver transformation is implemented using PySpark in:
@@ -56,18 +71,28 @@ Bronze PostgreSQL Tables
       PySpark Read
           |
           v
- Cleaning / Standardization
+ Schema Enforcement
           |
           v
- Add Audit Columns
-          |
-          v
-   Schema Validation
-          |
-          v
-    PostgreSQL Silver
-```
-
+Deduplication / Cleaning
+       /       \
+      v         v
+Quarantine   Valid Records
+                |
+                v
+      Standardization
+                |
+                v
+        Add Audit Columns
+                |
+                v
+       Staging Table
+                |
+                v
+ PostgreSQL UPSERT / MERGE
+                |
+                v
+          Silver Layer
 ---
 
 ## 4. Silver Links Transformation
@@ -87,16 +112,26 @@ The Silver table contains:
 - `MovieId`
 - `ImdbId`
 - `TmdbId`
-- `CreatedDtTm`
-- `UpdatedDtTm`
+- `CreateDtTm`
+- `UpdateDtTm`
 
-The transformation includes:
+`MovieId` is used as the business key for Silver deduplication and UPSERT processing.
 
-- Standardizing column names.
-- Removing duplicate records.
-- Adding audit timestamp columns.
-- Writing the transformed records to `silver.links`.
-- Recording the transformation execution in the transformation log.
+The transformation:
+
+- Enforces the expected source schema.
+- Identifies repeated records for the same `movieId`.
+- Retains one deterministic record for each `movieId`.
+- Identifies rejected duplicate records for quarantine.
+- Standardizes column names.
+- Adds audit timestamp columns.
+- UPSERTs valid records into `silver.links`.
+- Records source, target, and rejected row counts in the transformation log.
+
+Rejected duplicate representations are stored in `quarantine.links` with:
+
+```text
+Reason = DUPLICATE_MOVIE_ID
 
 ---
 
@@ -115,17 +150,29 @@ The Silver movies table contains:
 - `MovieId`
 - `Title`
 - `Genres`
-- `CreatedDtTm`
-- `UpdatedDtTm`
+- `CreateDtTm`
+- `UpdateDtTm`
 
 The transformation includes:
 
-- Standardizing column names.
-- Removing duplicate records.
-- Preserving the MovieLens genre representation.
-- Adding audit timestamp columns.
-- Writing the transformed data to `silver.movies`.
-- Recording the transformation execution in the transformation log.
+`MovieId` is used as the business key.
+
+The transformation:
+
+- Enforces the expected source schema.
+- Identifies repeated records for the same `movieId`.
+- Retains one deterministic record for each `movieId`.
+- Identifies rejected duplicate records for quarantine.
+- Standardizes column names.
+- Preserves the MovieLens genre representation.
+- Adds audit timestamp columns.
+- UPSERTs valid records into `silver.movies`.
+- Records transformation statistics in the transformation log.
+
+Rejected duplicate representations are stored in `quarantine.movies` with:
+
+```text
+Reason = DUPLICATE_MOVIE_ID
 
 The `Genres` column is retained in its source representation because genre splitting was not required for the current Silver asset.
 
@@ -155,8 +202,8 @@ The Silver ratings table contains:
 - `MovieId`
 - `Rating`
 - `Timestamp`
-- `CreatedDtTm`
-- `UpdatedDtTm`
+- `CreateDtTm`
+- `UpdateDtTm`
 
 ### Large Dataset Handling
 
@@ -168,25 +215,13 @@ The JDBC read uses `UserId` as the partitioning column so that the source data c
 
 This improves scalability and reduces the amount of data handled by an individual Spark task.
 
-### Duplicate Validation
+### Deduplication Strategy
 
-Applying a full Spark `dropDuplicates()` operation on the approximately 32 million row ratings dataset caused:
-
-```text
-java.lang.OutOfMemoryError: Java heap space
-```
-
-This happens because `dropDuplicates()` requires a large shuffle operation across the dataset.
-
-To avoid an unnecessary expensive shuffle on the local environment, duplicate records were validated separately using PostgreSQL.
-
-The duplicate validation returned:
+The combination of:
 
 ```text
-Duplicate Count = 0
+UserId + MovieId
 ```
-
-Since no duplicate records were present, an additional full-data deduplication shuffle was avoided during the ratings transformation.
 
 ---
 
@@ -206,8 +241,8 @@ The Silver tags table contains:
 - `MovieId`
 - `Tag`
 - `Timestamp`
-- `CreatedDtTm`
-- `UpdatedDtTm`
+- `CreateDtTm`
+- `UpdateDtTm`
 
 The transformation includes:
 
@@ -251,8 +286,8 @@ This provides consistent naming across the Silver assets.
 Two audit columns are added during the Silver transformation:
 
 ```text
-CreatedDtTm
-UpdatedDtTm
+CreateDtTm
+UpdateDtTm
 ```
 
 Both columns store transformation timestamps.
@@ -269,20 +304,22 @@ This ensures that timestamps generated during processing follow a consistent tim
 
 ## 10. Bronze-to-Silver Row Count Validation
 
-Row counts were compared between Bronze and Silver tables after transformation.
+Row counts are monitored during Silver transformations.
 
-The validation produced the following results:
+Bronze and Silver row counts are not expected to always match because the Bronze layer can preserve repeated raw ingestions, while the Silver layer retains records according to defined business keys.
 
-| Dataset | Bronze Count | Silver Count |
-|---|---:|---:|
-| links | 87,585 | 87,585 |
-| movies | 87,585 | 87,585 |
-| tags | 2,000,072 | 2,000,072 |
-| ratings | 32,000,204 | 32,000,204 |
+For example, repeated executions can result in multiple raw copies in `bronze.links` and `bronze.movies`, while Silver deduplication retains one record for each `MovieId`.
 
-The Bronze and Silver row counts match for all four datasets.
+The transformation log records:
 
-This confirms that no unexpected records were lost during the transformation process.
+- Source row count
+- Target row count
+- Bad/rejected row count
+- Transformation status
+
+The `bad_row_count` represents the number of physical source rows excluded from the Silver result.
+
+Quarantine storage may contain fewer rows than `bad_row_count` because identical rejected copies are collapsed into unique rejected record representations.
 
 ---
 
@@ -296,8 +333,8 @@ Validated:
 
 - `MovieId`
 - `ImdbId`
-- `CreatedDtTm`
-- `UpdatedDtTm`
+- `CreateDtTm`
+- `UpdateDtTm`
 
 Result:
 
@@ -314,8 +351,8 @@ Validated:
 - `MovieId`
 - `Title`
 - `Genres`
-- `CreatedDtTm`
-- `UpdatedDtTm`
+- `CreateDtTm`
+- `UpdateDtTm`
 
 Result:
 
@@ -333,8 +370,8 @@ Validated:
 - `MovieId`
 - `Rating`
 - `Timestamp`
-- `CreatedDtTm`
-- `UpdatedDtTm`
+- `CreateDtTm`
+- `UpdateDtTm`
 
 Result:
 
@@ -352,8 +389,8 @@ Validated:
 - `MovieId`
 - `Tag`
 - `Timestamp`
-- `CreatedDtTm`
-- `UpdatedDtTm`
+- `CreateDtTm`
+- `UpdateDtTm`
 
 Result:
 
@@ -369,15 +406,22 @@ Therefore, the required business and audit columns were successfully populated d
 
 ## 12. Duplicate Validation
 
-Duplicate checks were performed on the Silver assets.
+Duplicate handling is performed according to the business key of each Silver asset.
 
-The duplicate validation result for all datasets was:
+The primary business keys are:
 
-```text
-Duplicate Count = 0
-```
+| Silver Asset | Business Key |
+|---|---|
+| `silver.links` | `MovieId` |
+| `silver.movies` | `MovieId` |
+| `silver.ratings` | `UserId`, `MovieId` |
+| `silver.tags` | `UserId`, `MovieId`, `Tag`, `Timestamp` |
+| `silver.movie_metadata` | `MovieId` |
+| `silver.user_ratings_master` | `UserId`, `MovieId` |
 
-No duplicate records were detected in the validated Silver datasets.
+Unique indexes are created on these keys to enforce target-level uniqueness and support PostgreSQL UPSERT processing.
+
+Validation confirmed that duplicate business keys were not present in the resulting Silver assets.
 
 ---
 
@@ -407,7 +451,7 @@ The following Data Quality checks were performed after creating the Silver asset
 
 | Validation | Result |
 |---|---|
-| Bronze vs Silver row count | Passed |
+| Source and target row count | Passed |
 | Schema / datatype validation | Passed |
 | Required column null validation | Passed |
 | Audit column validation | Passed |
@@ -430,7 +474,47 @@ The transformation logs are stored in PostgreSQL and record successful Silver tr
 
 ---
 
-## 16. Airflow Orchestration
+## 16. UPSERT and Idempotent Loading
+
+Silver tables are maintained using a staging-based PostgreSQL UPSERT process.
+
+For each Silver asset:
+
+1. Valid transformed data is prepared in PySpark.
+2. The data is written to a temporary staging table.
+3. A unique index is maintained on the target business key.
+4. Records are merged into the Silver target using PostgreSQL `INSERT ... ON CONFLICT`.
+5. Existing records are updated only when relevant business data has changed.
+6. New business keys are inserted.
+7. The staging table is removed after successful processing.
+
+`CreateDtTm` is excluded from normal update operations so that the original creation timestamp is preserved.
+
+This makes repeated Silver executions idempotent: rerunning the same source data does not create duplicate Silver business records.
+
+---
+
+## 17. Quarantine Layer
+
+The `quarantine` PostgreSQL schema stores rejected record representations identified during Silver processing.
+
+The quarantine process captures:
+
+- The rejected source record
+- A rejection `Reason`
+- `QuarantinedDtTm`
+
+Examples of rejection reasons include:
+
+```text
+DUPLICATE_MOVIE_ID
+OLDER_DUPLICATE_RATING
+EXACT_DUPLICATE_TAG
+```
+
+---
+
+## 18. Airflow Orchestration
 
 The MovieLens pipeline uses separate Airflow DAGs for Bronze ingestion and Silver transformation.
 
@@ -470,7 +554,7 @@ After Bronze validation completes successfully, `trigger_silver_dag` triggers th
 
 ---
 
-## 17. Silver Transformation DAG
+## 19. Silver Transformation DAG
 
 DAG ID:
 
@@ -499,7 +583,7 @@ This prevents the Silver transformation from running before the required Bronze 
 
 ---
 
-## 18. Bronze-to-Silver DAG Dependency
+## 20. Bronze-to-Silver DAG Dependency
 
 The Bronze and Silver processes are maintained as separate DAGs to keep the pipeline modular.
 
@@ -522,7 +606,7 @@ This design separates ingestion and transformation responsibilities while still 
 
 ---
 
-## 19. Complete Day 3 Data Flow
+## 21. Complete Day 3 Data Flow
 
 The completed data flow for the Silver layer is:
 
@@ -536,34 +620,42 @@ Bronze Ingestion DAG
 PostgreSQL Bronze
         |
         v
-Bronze Validation
-        |
-        v
 Trigger Silver DAG
         |
         v
 PySpark Silver Transformations
         |
-        +-----------------------+
-        |                       |
-        v                       v
-Cleaning / Standardization   Audit Columns
-        |                       |
-        +-----------+-----------+
-                    |
-                    v
-             PostgreSQL Silver
-                    |
-                    v
-          Data Quality Validation
-                    |
-                    v
-          Transformation Logging
+        v
+Schema Enforcement
+        |
+        v
+Deduplication
+      /     \
+     v       v
+Quarantine  Valid Records
+                 |
+                 v
+        Cleaning / Standardization
+                 |
+                 v
+            Audit Columns
+                 |
+                 v
+            Staging Tables
+                 |
+                 v
+          PostgreSQL UPSERT
+                 |
+                 v
+             Silver Layer
+                 |
+                 v
+     Transformation Logging
 ```
 
 ---
 
-## 20. Final Silver Assets
+## 22. Final Silver Assets
 
 At the completion of Day 3, the following Silver assets were successfully created:
 
@@ -578,14 +670,14 @@ The Silver layer now provides standardized and validated datasets that can be us
 
 ---
 
-## 21. Day 3 Completion Summary
+## 23. Day 3 Completion Summary
 
 The following activities were completed as part of the Silver layer implementation:
 
 - Created Silver assets from Bronze objects.
 - Implemented PySpark transformations.
 - Standardized column naming.
-- Added `CreatedDtTm` and `UpdatedDtTm` audit columns.
+- Added `CreateDtTm` and `UpdateDtTm` audit columns.
 - Configured UTC timestamp handling.
 - Handled the large ratings dataset using partitioned JDBC reading.
 - Validated Bronze and Silver row counts.

@@ -1,4 +1,5 @@
 import sys
+from psycopg2 import sql
 
 from pyspark.sql.types import(
     StructType,
@@ -18,7 +19,8 @@ from src.python.utils import (
     create_spark_session,
     write_transformation_log,
     get_table_row_count,
-    enforce_schema
+    enforce_schema,
+    get_postgres_connection
 )
 
 from pyspark.sql.functions import (
@@ -29,8 +31,10 @@ from pyspark.sql.functions import (
     col,
     concat_ws,
     collect_set,
+    sort_array,
     from_unixtime,
-    row_number
+    row_number,
+    lit
 )
 
 from pyspark.sql.window import Window
@@ -104,6 +108,10 @@ def deduplicate_data(
     if key_cols is None:
         return df.dropDuplicates()
 
+    # Business-key deduplication when no ordering column is required
+    if order_col is None:
+        return df.dropDuplicates(key_cols)
+
     # Business-key deduplication:keeping latest record based on order_col
     window_spec = (
         Window
@@ -126,6 +134,350 @@ def deduplicate_data(
     )
 
 
+def ensure_unique_index(
+    target_table,
+    key_columns
+):
+
+    schema_name, table_name = target_table.split(".")
+
+    index_name = (
+        f"uq_{schema_name}_{table_name}_"
+        f"{'_'.join(key_columns)}"
+    ).lower()
+
+    conn = get_postgres_connection()
+    cursor = conn.cursor()
+
+    try:
+
+        # Checking whether target table exists
+        cursor.execute(
+            "SELECT to_regclass(%s)",
+            (target_table,)
+        )
+
+        table_exists = (
+            cursor.fetchone()[0]
+            is not None
+        )
+
+        if not table_exists:
+
+            print(
+                f"{target_table} does not exist yet. "
+                "Unique index will be created after initial load."
+            )
+
+            return
+
+        index_query = sql.SQL("""
+            CREATE UNIQUE INDEX IF NOT EXISTS {}
+            ON {}.{} ({})
+        """).format(
+            sql.Identifier(index_name),
+            sql.Identifier(schema_name),
+            sql.Identifier(table_name),
+            sql.SQL(", ").join(
+                sql.Identifier(column_name)
+                for column_name in key_columns
+            )
+        )
+
+        cursor.execute(index_query)
+
+        conn.commit()
+
+        print(
+            f"Unique index ensured on "
+            f"{target_table} for {key_columns}"
+        )
+
+    except Exception:
+
+        conn.rollback()
+        raise
+
+    finally:
+
+        cursor.close()
+        conn.close()
+
+
+def upsert_to_postgres(
+    df,
+    target_table,
+    key_columns
+):
+
+    schema_name, table_name = target_table.split(".")
+
+    staging_table_name = (
+        f"{table_name}_staging"
+    )
+
+    staging_table = (
+        f"{schema_name}.{staging_table_name}"
+    )
+
+    conn = get_postgres_connection()
+    cursor = conn.cursor()
+
+    try:
+
+        # Check whether final Silver table already exists
+        cursor.execute(
+            "SELECT to_regclass(%s)",
+            (target_table,)
+        )
+
+        table_exists = (
+            cursor.fetchone()[0]
+            is not None
+        )
+
+        # First load
+        if not table_exists:
+
+            print(
+                f"{target_table} does not exist. "
+                "Creating initial table."
+            )
+
+            df.write.jdbc(
+                url=POSTGRES_URL,
+                table=target_table,
+                mode="append",
+                properties=POSTGRES_PROPERTIES
+            )
+
+            ensure_unique_index(
+                target_table,
+                key_columns
+            )
+
+            print(
+                f"{target_table} created successfully"
+            )
+
+        # Subsequent loads
+        else:
+
+            print(
+                f"Preparing upsert for {target_table}"
+            )
+
+            ensure_unique_index(
+                target_table,
+                key_columns
+            )
+
+            # Temporary staging table can safely be overwritten
+            df.write.jdbc(
+                url=POSTGRES_URL,
+                table=staging_table,
+                mode="overwrite",
+                properties=POSTGRES_PROPERTIES
+            )
+
+            print(
+                f"Staging table {staging_table} "
+                "created successfully"
+            )
+
+            all_columns = df.columns
+
+            # Creating a list of columns that can be updated
+            # CreateDtTm must remain unchanged for an already-existing record
+            update_columns = [
+                column_name
+                for column_name in all_columns
+                if column_name not in key_columns
+                and column_name not in [
+                    "CreateDtTm",
+                    "QuarantinedDtTm"
+                ]
+            ]
+
+            # Columns that is used to determine whether the business data has actually changed
+            comparison_columns = [
+                column_name
+                for column_name in update_columns
+                if column_name != "UpdateDtTm"
+            ]
+
+            insert_columns_sql = sql.SQL(", ").join(
+                sql.Identifier(column_name)
+                for column_name in all_columns
+            )
+
+            select_columns_sql = sql.SQL(", ").join(
+                sql.Identifier(column_name)
+                for column_name in all_columns
+            )
+
+            conflict_columns_sql = sql.SQL(", ").join(
+                sql.Identifier(column_name)
+                for column_name in key_columns
+            )
+
+            update_sql = sql.SQL(", ").join(
+                sql.SQL("{} = EXCLUDED.{}").format(
+                    sql.Identifier(column_name),
+                    sql.Identifier(column_name)
+                )
+                for column_name in update_columns
+            )
+
+            # Only update an existing row when its actual business values changed
+            change_conditions = [
+                sql.SQL(
+                    "target.{} IS DISTINCT FROM "
+                    "EXCLUDED.{}"
+                ).format(
+                    sql.Identifier(column_name),
+                    sql.Identifier(column_name)
+                )
+                for column_name in comparison_columns
+            ]
+
+            if change_conditions:
+
+                change_condition_sql = (
+                    sql.SQL(" OR ").join(
+                        change_conditions
+                    )
+                )
+
+                merge_query = sql.SQL("""
+                    INSERT INTO {}.{} AS target ({})
+                    SELECT {}
+                    FROM {}.{}
+                    ON CONFLICT ({})
+                    DO UPDATE
+                    SET {}
+                    WHERE {}
+                """).format(
+                    sql.Identifier(schema_name),
+                    sql.Identifier(table_name),
+                    insert_columns_sql,
+                    select_columns_sql,
+                    sql.Identifier(schema_name),
+                    sql.Identifier(staging_table_name),
+                    conflict_columns_sql,
+                    update_sql,
+                    change_condition_sql
+                )
+
+            else:
+
+                merge_query = sql.SQL("""
+                    INSERT INTO {}.{} ({})
+                    SELECT {}
+                    FROM {}.{}
+                    ON CONFLICT ({})
+                    DO NOTHING
+                """).format(
+                    sql.Identifier(schema_name),
+                    sql.Identifier(table_name),
+                    insert_columns_sql,
+                    select_columns_sql,
+                    sql.Identifier(schema_name),
+                    sql.Identifier(staging_table_name),
+                    conflict_columns_sql
+                )
+
+            cursor.execute(
+                merge_query
+            )
+
+            conn.commit()
+
+            print(
+                f"{target_table} upsert completed "
+                "successfully"
+            )
+
+            # Removing temporary staging table
+            cursor.execute(
+                sql.SQL(
+                    "DROP TABLE IF EXISTS {}.{}"
+                ).format(
+                    sql.Identifier(schema_name),
+                    sql.Identifier(
+                        staging_table_name
+                    )
+                )
+            )
+
+            conn.commit()
+
+            print(
+                f"Staging table {staging_table} removed"
+            )
+
+    except Exception:
+
+        conn.rollback()
+        raise
+
+    finally:
+
+        cursor.close()
+        conn.close()
+
+
+def write_to_quarantine(
+    df,
+    target_table,
+    key_columns
+):
+
+    quarantine_row_count = df.count()
+
+    if quarantine_row_count == 0:
+
+        print(
+            f"No rows to quarantine for "
+            f"{target_table}"
+        )
+
+        return 0
+
+    print(
+        f"Unique rejected rows identified "
+        f"for {target_table}: "
+        f"{quarantine_row_count}"
+    )
+
+    # Add quarantine audit timestamp
+    quarantine_df = (
+        df
+        .withColumn(
+            "QuarantinedDtTm",
+            current_timestamp()
+        )
+    )
+
+    # Using UPSERT so rerunning the Silver DAG does not repeatedly store the same rejected record
+    upsert_to_postgres(
+        df=quarantine_df,
+        target_table=target_table,
+        key_columns=key_columns
+    )
+
+    final_count = get_table_row_count(
+        target_table
+    )
+
+    print(
+        f"{target_table} total row count: "
+        f"{final_count}"
+    )
+
+    return quarantine_row_count
+
+
 def transform_links(spark):
 
     try:
@@ -140,12 +492,71 @@ def transform_links(spark):
         )
 
         print("bronze.links loaded successfully")
-        print(f"Bronze links count: {links_df.count()}")
+        source_row_count = links_df.count()
 
-        links_silver_df = deduplicate_data(links_df)
+        print(
+            f"Bronze links count: "
+            f"{source_row_count}"
+        )
+
+        # Rank records having the same MovieId. One record will be retained for Silver and the remaining duplicate records will be identified for quarantine
+        links_window = (
+            Window
+            .partitionBy("movieId")
+            .orderBy(
+                col("imdbId").asc_nulls_last(),
+                col("tmdbId").asc_nulls_last()
+            )
+        )
+
+        links_ranked_df = (
+            links_df
+            .withColumn(
+                "_row_num",
+                row_number().over(links_window)
+            )
+        )
+
+        # Keeping one record for each MovieId in Silver
+        links_deduplicated_df = (
+            links_ranked_df
+            .filter(
+                col("_row_num") == 1
+            )
+            .drop("_row_num")
+        )
+
+        deduplicated_row_count = (
+            links_deduplicated_df.count()
+        )
+
+        # Identifying the actual records rejected during deduplication
+        links_quarantine_df = (
+            links_ranked_df
+            .filter(
+                col("_row_num") > 1
+            )
+            .drop("_row_num")
+            .dropDuplicates(
+                [
+                    "movieId",
+                    "imdbId",
+                    "tmdbId"
+                ]
+            )
+            .withColumn(
+                "Reason",
+                lit("DUPLICATE_MOVIE_ID")
+            )
+        )
+
+        print(
+            f"Deduplicated links count: "
+            f"{deduplicated_row_count}"
+        )
 
         links_silver_df = rename_columns_to_pascal_case(
-            links_silver_df
+            links_deduplicated_df
         )
 
         links_silver_df = (
@@ -156,20 +567,54 @@ def transform_links(spark):
 
         links_silver_df.printSchema()
 
-        source_row_count = links_df.count()
-        target_row_count = links_silver_df.count()
-        bad_row_count = source_row_count - target_row_count
-
-        print(f"Silver links count: {target_row_count}")
-
-        links_silver_df.write.jdbc(
-            url=POSTGRES_URL,
-            table="silver.links",
-            mode="overwrite",
-            properties=POSTGRES_PROPERTIES
+        # Number of duplicate rows removed from Bronze
+        bad_row_count = (
+            source_row_count
+            - deduplicated_row_count
         )
 
-        print("silver.links written successfully to PostgreSQL")
+        print(
+            f"Duplicate links removed: "
+            f"{bad_row_count}"
+        )
+
+        # Storing unique rejected duplicate records in the quarantine layer
+        quarantined_row_count = write_to_quarantine(
+            df=links_quarantine_df,
+            target_table="quarantine.links",
+            key_columns=[
+                "movieId",
+                "imdbId",
+                "tmdbId",
+                "Reason"
+            ]
+        )
+
+        print(
+            f"Unique links records stored in "
+            f"quarantine: {quarantined_row_count}"
+        )
+
+        # Upsert cleaned data into Silver
+        upsert_to_postgres(
+            df=links_silver_df,
+            target_table="silver.links",
+            key_columns=["MovieId"]
+        )
+
+        # Get actual final Silver table count
+        target_row_count = get_table_row_count(
+            "silver.links"
+        )
+
+        print(
+            f"Silver links count after upsert: "
+            f"{target_row_count}"
+        )
+
+        print(
+            "silver.links upsert completed successfully"
+        )
 
         write_transformation_log(
             source_table="bronze.links",
@@ -210,12 +655,75 @@ def transform_movies(spark):
         )
 
         print("bronze.movies loaded successfully")
-        print(f"Bronze movies count: {movies_df.count()}")
+        source_row_count = movies_df.count()
 
-        movies_silver_df = deduplicate_data(movies_df)
+        print(
+            f"Bronze movies count: "
+            f"{source_row_count}"
+        )
+
+        # Ranking records having the same MovieId. One record will be retained for Silver and remaining duplicate records will be quarantined
+        movies_window = (
+            Window
+            .partitionBy("movieId")
+            .orderBy(
+                col("title").asc_nulls_last(),
+                col("genres").asc_nulls_last()
+            )
+        )
+
+        movies_ranked_df = (
+            movies_df
+            .withColumn(
+                "_row_num",
+                row_number().over(movies_window)
+            )
+        )
+
+        # Keeping one record per MovieId for Silver
+        movies_deduplicated_df = (
+            movies_ranked_df
+            .filter(
+                col("_row_num") == 1
+            )
+            .drop("_row_num")
+        )
+
+        deduplicated_row_count = (
+            movies_deduplicated_df.count()
+        )
+
+        # Storing only unique rejected duplicate records
+        movies_quarantine_df = (
+            movies_ranked_df
+            .filter(
+                col("_row_num") > 1
+            )
+            .drop("_row_num")
+            .dropDuplicates(
+                [
+                    "movieId",
+                    "title",
+                    "genres"
+                ]
+            )
+            .withColumn(
+                "Reason",
+                lit("DUPLICATE_MOVIE_ID")
+            )
+        )
+
+        deduplicated_row_count = (
+            movies_deduplicated_df.count()
+        )
+
+        print(
+            f"Deduplicated movies count: "
+            f"{deduplicated_row_count}"
+        )
 
         movies_silver_df = rename_columns_to_pascal_case(
-            movies_silver_df
+            movies_deduplicated_df
         )
 
         movies_silver_df = (
@@ -226,20 +734,53 @@ def transform_movies(spark):
 
         movies_silver_df.printSchema()
 
-        source_row_count = movies_df.count()
-        target_row_count = movies_silver_df.count()
-        bad_row_count = source_row_count - target_row_count
-
-        print(f"Silver movies count: {target_row_count}")
-
-        movies_silver_df.write.jdbc(
-            url=POSTGRES_URL,
-            table="silver.movies",
-            mode="overwrite",
-            properties=POSTGRES_PROPERTIES
+        # Number of duplicate rows removed from Bronze
+        bad_row_count = (
+            source_row_count
+            - deduplicated_row_count
         )
 
-        print("silver.movies written successfully to PostgreSQL")
+        print(
+            f"Duplicate movies removed: "
+            f"{bad_row_count}"
+        )
+
+        quarantined_row_count = write_to_quarantine(
+            df=movies_quarantine_df,
+            target_table="quarantine.movies",
+            key_columns=[
+                "movieId",
+                "title",
+                "genres",
+                "Reason"
+            ]
+        )
+
+        print(
+            f"Unique movie records stored in "
+            f"quarantine: {quarantined_row_count}"
+        )
+
+        # Upsert cleaned data into Silver
+        upsert_to_postgres(
+            df=movies_silver_df,
+            target_table="silver.movies",
+            key_columns=["MovieId"]
+        )
+
+        # Get actual final Silver row count
+        target_row_count = get_table_row_count(
+            "silver.movies"
+        )
+
+        print(
+            f"Silver movies count after upsert: "
+            f"{target_row_count}"
+        )
+
+        print(
+            "silver.movies upsert completed successfully"
+        )
 
         write_transformation_log(
             source_table="bronze.movies",
@@ -297,13 +838,68 @@ def transform_ratings(spark):
 
         print(f"Bronze ratings count: {source_row_count}")
 
-        ratings_deduplicated_df = deduplicate_data(
-            ratings_df,
-            key_cols=[
+        # Keep only the latest rating for each UserId + MovieId combination
+        # Rank ratings for each UserId + MovieId and Latest rating will be retained in Silver
+        ratings_window = (
+            Window
+            .partitionBy(
                 "userId",
                 "movieId"
-            ],
-            order_col="timestamp"
+            )
+            .orderBy(
+                col("timestamp").desc()
+            )
+        )
+
+        ratings_ranked_df = (
+            ratings_df
+            .withColumn(
+                "_row_num",
+                row_number().over(ratings_window)
+            )
+        )
+
+        # Keeping latest rating for Silver
+        ratings_deduplicated_df = (
+            ratings_ranked_df
+            .filter(
+                col("_row_num") == 1
+            )
+            .drop("_row_num")
+        )
+
+        deduplicated_row_count = (
+            ratings_deduplicated_df.count()
+        )
+
+        # Older duplicate ratings are rejected
+        ratings_quarantine_df = (
+            ratings_ranked_df
+            .filter(
+                col("_row_num") > 1
+            )
+            .drop("_row_num")
+            .dropDuplicates(
+                [
+                    "userId",
+                    "movieId",
+                    "rating",
+                    "timestamp"
+                ]
+            )
+            .withColumn(
+                "Reason",
+                lit("OLDER_DUPLICATE_RATING")
+            )
+        )
+
+        deduplicated_row_count = (
+            ratings_deduplicated_df.count()
+        )
+
+        print(
+            f"Deduplicated ratings count: "
+            f"{deduplicated_row_count}"
         )
 
         ratings_silver_df = rename_columns_to_pascal_case(
@@ -330,19 +926,57 @@ def transform_ratings(spark):
 
         ratings_silver_df.printSchema()
 
-        target_row_count = ratings_silver_df.count()
-        bad_row_count = source_row_count - target_row_count
-
-        print(f"Silver ratings count: {target_row_count}")
-
-        ratings_silver_df.write.jdbc(
-            url=POSTGRES_URL,
-            table="silver.ratings",
-            mode="overwrite",
-            properties=POSTGRES_PROPERTIES
+        # Rows removed during deduplication
+        bad_row_count = (
+            source_row_count
+            - deduplicated_row_count
         )
 
-        print("silver.ratings written successfully to PostgreSQL")
+        print(
+            f"Duplicate ratings removed: "
+            f"{bad_row_count}"
+        )
+
+        quarantined_row_count = write_to_quarantine(
+            df=ratings_quarantine_df,
+            target_table="quarantine.ratings",
+            key_columns=[
+                "userId",
+                "movieId",
+                "rating",
+                "timestamp",
+                "Reason"
+            ]
+        )
+
+        print(
+            f"Unique rating records stored in "
+            f"quarantine: {quarantined_row_count}"
+        )
+
+        # Upsert cleaned ratings into Silver = UserId + MovieId identifies one user's current rating for a movie
+        upsert_to_postgres(
+            df=ratings_silver_df,
+            target_table="silver.ratings",
+            key_columns=[
+                "UserId",
+                "MovieId"
+            ]
+        )
+
+        # Get actual final count after upsert
+        target_row_count = get_table_row_count(
+            "silver.ratings"
+        )
+
+        print(
+            f"Silver ratings count after upsert: "
+            f"{target_row_count}"
+        )
+
+        print(
+            "silver.ratings upsert completed successfully"
+        )
 
         write_transformation_log(
             source_table="bronze.ratings",
@@ -388,10 +1022,69 @@ def transform_tags(spark):
 
         print(f"Bronze tags count: {source_row_count}")
 
-        tags_silver_df = deduplicate_data(tags_df)
+        # Ranking exact duplicate tag records. One copy will be retained for Silver and remaining copies will be identified for quarantine
+        tags_window = (
+            Window
+            .partitionBy(
+                "userId",
+                "movieId",
+                "tag",
+                "timestamp"
+            )
+            .orderBy(
+                col("timestamp").desc()
+            )
+        )
+
+        tags_ranked_df = (
+            tags_df
+            .withColumn(
+                "_row_num",
+                row_number().over(tags_window)
+            )
+        )
+
+        # Keeping one copy of each exact tag record for Silver
+        tags_deduplicated_df = (
+            tags_ranked_df
+            .filter(
+                col("_row_num") == 1
+            )
+            .drop("_row_num")
+        )
+
+        deduplicated_row_count = (
+            tags_deduplicated_df.count()
+        )
+
+        # Identifying exact duplicate records rejected from Silver
+        tags_quarantine_df = (
+            tags_ranked_df
+            .filter(
+                col("_row_num") > 1
+            )
+            .drop("_row_num")
+            .dropDuplicates(
+                [
+                    "userId",
+                    "movieId",
+                    "tag",
+                    "timestamp"
+                ]
+            )
+            .withColumn(
+                "Reason",
+                lit("EXACT_DUPLICATE_TAG")
+            )
+        )
+
+        print(
+            f"Deduplicated tags count: "
+            f"{deduplicated_row_count}"
+        )
 
         tags_silver_df = rename_columns_to_pascal_case(
-            tags_silver_df
+            tags_deduplicated_df
         )
 
         tags_silver_df = (
@@ -414,19 +1107,60 @@ def transform_tags(spark):
 
         tags_silver_df.printSchema()
 
-        target_row_count = tags_silver_df.count()
-        bad_row_count = source_row_count - target_row_count
-
-        print(f"Silver tags count: {target_row_count}")
-
-        tags_silver_df.write.jdbc(
-            url=POSTGRES_URL,
-            table="silver.tags",
-            mode="overwrite",
-            properties=POSTGRES_PROPERTIES
+        # Number of duplicate rows removed
+        bad_row_count = (
+            source_row_count
+            - deduplicated_row_count
         )
 
-        print("silver.tags written successfully to PostgreSQL")
+        print(
+            f"Duplicate tags removed: "
+            f"{bad_row_count}"
+        )
+
+        # Store unique rejected duplicate tag records in the quarantine layer
+        quarantined_row_count = write_to_quarantine(
+            df=tags_quarantine_df,
+            target_table="quarantine.tags",
+            key_columns=[
+                "userId",
+                "movieId",
+                "tag",
+                "timestamp",
+                "Reason"
+            ]
+        )
+
+        print(
+            f"Unique tag records stored in "
+            f"quarantine: {quarantined_row_count}"
+        )
+
+        # Upsert cleaned tag events into Silver
+        upsert_to_postgres(
+            df=tags_silver_df,
+            target_table="silver.tags",
+            key_columns=[
+                "UserId",
+                "MovieId",
+                "Tag",
+                "Timestamp"
+            ]
+        )
+
+        # Get actual final Silver table count
+        target_row_count = get_table_row_count(
+            "silver.tags"
+        )
+
+        print(
+            f"Silver tags count after upsert: "
+            f"{target_row_count}"
+        )
+
+        print(
+            "silver.tags upsert completed successfully"
+        )
 
         write_transformation_log(
             source_table="bronze.tags",
@@ -548,23 +1282,46 @@ def transform_movie_metadata(spark):
 
         movie_metadata_df.printSchema()
 
-        target_row_count = movie_metadata_df.count()
+        source_row_count = movies_row_count
 
-        print(
-            f"silver.movie_metadata count: "
-            f"{target_row_count}"
-        )
-
-        # Writing derived Silver asset to PostgreSQL
-        movie_metadata_df.write.jdbc(
-            url=POSTGRES_URL,
-            table="silver.movie_metadata",
-            mode="overwrite",
-            properties=POSTGRES_PROPERTIES
+        transformed_row_count = (
+            movie_metadata_df.count()
         )
 
         print(
-            "silver.movie_metadata written successfully to PostgreSQL"
+            f"Prepared movie_metadata count: "
+            f"{transformed_row_count}"
+        )
+
+        # Since MovieId is unique in silver.movies,
+        # one movie_metadata row is expected per movie.
+        bad_row_count = (
+            source_row_count
+            - transformed_row_count
+        )
+
+        # Upsert derived metadata into Silver
+        upsert_to_postgres(
+            df=movie_metadata_df,
+            target_table="silver.movie_metadata",
+            key_columns=[
+                "MovieId"
+            ]
+        )
+
+        # Get actual final table count after upsert
+        target_row_count = get_table_row_count(
+            "silver.movie_metadata"
+        )
+
+        print(
+            f"Silver movie_metadata count "
+            f"after upsert: {target_row_count}"
+        )
+
+        print(
+            "silver.movie_metadata "
+            "upsert completed successfully"
         )
 
         write_transformation_log(
@@ -572,7 +1329,7 @@ def transform_movie_metadata(spark):
             target_table="silver.movie_metadata",
             source_row_count=movies_row_count,
             target_row_count=target_row_count,
-            bad_row_count=movies_row_count - target_row_count,
+            bad_row_count=bad_row_count,
             status="SUCCESS"
         )
 
@@ -621,7 +1378,9 @@ def transform_user_ratings_master(spark):
             .agg(
                 concat_ws(
                     ", ",
-                    collect_set("Tag")
+                    sort_array(
+                            collect_set("Tag")
+                    )
                 ).alias("Tags")
             )
         )
@@ -647,8 +1406,6 @@ def transform_user_ratings_master(spark):
         min_user_id = 1
         max_user_id = 200948
         batch_size = 25000
-
-        first_batch = True
 
         for start_user_id in range(
             min_user_id,
@@ -762,29 +1519,28 @@ def transform_user_ratings_master(spark):
                 )
             )
 
-            # First batch overwrites old table Remaining batches append
-            write_mode = (
-                "overwrite"
-                if first_batch
-                else "append"
-            )
-
-            user_ratings_master_batch_df.write.jdbc(
-                url=POSTGRES_URL,
-                table="silver.user_ratings_master",
-                mode=write_mode,
-                properties=POSTGRES_PROPERTIES
+            # Upsert each batch into the final Silver table
+            # instead of overwrite for first batch
+            # and append for remaining batches.
+            upsert_to_postgres(
+                df=user_ratings_master_batch_df,
+                target_table=(
+                    "silver.user_ratings_master"
+                ),
+                key_columns=[
+                    "UserId",
+                    "MovieId"
+                ]
             )
 
             print(
                 f"Batch {start_user_id} - "
-                f"{end_user_id} written successfully"
+                f"{end_user_id} "
+                "upserted successfully"
             )
 
-            first_batch = False
-
         print(
-            "silver.user_ratings_master written successfully to PostgreSQL"
+            "silver.user_ratings_master upsert completed successfully"
         )
 
         source_row_count = get_table_row_count(
@@ -805,6 +1561,13 @@ def transform_user_ratings_master(spark):
             f"{target_row_count}"
         )
 
+        # Since LEFT JOINs are used, every Silver rating is expected to remain in the master table
+        bad_row_count = max(
+            source_row_count
+            - target_row_count,
+            0
+        )
+
         write_transformation_log(
             source_table=(
                 "silver.ratings + "
@@ -814,10 +1577,7 @@ def transform_user_ratings_master(spark):
             target_table="silver.user_ratings_master",
             source_row_count=source_row_count,
             target_row_count=target_row_count,
-            bad_row_count=(
-                source_row_count
-                - target_row_count
-            ),
+            bad_row_count=bad_row_count,
             status="SUCCESS"
         )
 
